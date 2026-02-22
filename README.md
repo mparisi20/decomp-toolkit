@@ -25,8 +25,8 @@ project structure and build system that uses jeff under the hood.
 You supply the xex, and the underlying exe will be extracted to the same directory - it'll even have its original name the developers gave it!
 - Can print out information about an xex using: `xex info <xex location>`.
 This aims to replicate the behavior of the original xextool by xorloser.
-- Can write down inferred splits, symbols, and COFFs from an xex using: `xex info <config.yml>`.
-This is NOT meant to be run on its own, but rather part of a build system, such as the one in the dtk-template above.
+- Can write down inferred splits, symbols, and COFFs from an xex using: `xex split <config.yml>`.
+This is NOT meant to be run on its own, but rather part of a build system, such as the one in the jeff-template above.
 
 ## Known Issues/Hacks
 - When parsing .map files, the last split of a section will not get added.
