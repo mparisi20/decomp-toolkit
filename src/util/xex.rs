@@ -22,9 +22,9 @@ use typed_path::{Utf8NativePathBuf, Utf8UnixPath};
 use crate::{
     analysis::{cfa::SectionAddress, read_u32},
     obj::{
-        ObjArchitecture, ObjInfo, ObjKind, ObjSection, ObjSectionKind, ObjSymbol, ObjSymbolFlagSet,
-        ObjSymbolFlags, ObjSymbolKind, ObjSymbolScope, SectionIndex as ObjSectionIndex,
-        SectionIndex, SymbolIndex,
+        ObjArchitecture, ObjInfo, ObjKind, ObjRelocKind, ObjSection, ObjSectionKind, ObjSymbol,
+        ObjSymbolFlagSet, ObjSymbolFlags, ObjSymbolKind, ObjSymbolScope,
+        SectionIndex as ObjSectionIndex, SectionIndex, SymbolIndex,
     },
     util::{crypto::decrypt_aes128_cbc_no_padding, xex_imports::replace_ordinal},
 };
@@ -1317,21 +1317,21 @@ pub fn write_coff(obj: &ObjInfo) -> Result<Vec<u8>> {
                     flags: RelocationFlags::Coff { typ: reloc.to_coff() },
                 },
             )?;
-            // // MSVC requires an extra relocation to pair up high and low ones
-            // match reloc.kind {
-            //     ObjRelocKind::PpcAddr16Ha | ObjRelocKind::PpcAddr16Lo => {
-            //         cur_coff.add_relocation(
-            //             *sect_map.get(&sect_idx).unwrap(),
-            //             object::write::Relocation {
-            //                 offset: addr as u64,
-            //                 symbol: *sym_id,
-            //                 addend: 0,
-            //                 flags: RelocationFlags::Coff { typ: object::pe::IMAGE_REL_PPC_PAIR },
-            //             },
-            //         )?;
-            //     }
-            //     _ => {}
-            // }
+            // MSVC requires an extra relocation to pair up high and low ones
+            match reloc.kind {
+                ObjRelocKind::PpcAddr16Ha | ObjRelocKind::PpcAddr16Lo => {
+                    cur_coff.add_relocation(
+                        *sect_map.get(&sect_idx).unwrap(),
+                        object::write::Relocation {
+                            offset: addr as u64,
+                            symbol: *sym_id,
+                            addend: 0,
+                            flags: RelocationFlags::Coff { typ: object::pe::IMAGE_REL_PPC_PAIR },
+                        },
+                    )?;
+                }
+                _ => {}
+            }
         }
     }
 
