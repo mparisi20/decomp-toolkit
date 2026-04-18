@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{ensure, Result};
 use itertools::Itertools;
-use pdb2::{self, FallibleIterator};
+use pdb2::{self, FallibleIterator, Indirection, PrimitiveKind, TypeFinder, TypeIndex};
 use typed_path::Utf8NativePathBuf;
 
 use crate::{
@@ -52,6 +52,133 @@ fn to_section_addr(
     SectionAddress { section: jeff_sect, address: sect_base as u32 + sect_offs.offset }
 }
 
+/// Attempt to deduce the size of the type referenced by index using the
+/// TypeFinder
+fn lookup_type_size(ty_finder: &TypeFinder, index: TypeIndex) -> Result<u64> {
+    match ty_finder.find(index)?.parse()? {
+        pdb2::TypeData::Array(data) => {
+            // Note: the last "dimension" is the total size in bytes of the
+            // array. See the documentation for the dimensions field
+            Ok(data.dimensions[data.dimensions.len() - 1].into())
+        }
+        pdb2::TypeData::Class(data) => Ok(data.size),
+        pdb2::TypeData::Enumeration(data) => lookup_type_size(ty_finder, data.underlying_type),
+        pdb2::TypeData::Modifier(data) => lookup_type_size(ty_finder, data.underlying_type),
+        pdb2::TypeData::Pointer(_) => Ok(4),
+        pdb2::TypeData::Union(data) => Ok(data.size),
+        pdb2::TypeData::Primitive(data) => {
+            // Check if this is a pointer to a primitive type
+            match data.indirection {
+                Some(Indirection::Near32) => {
+                    return Ok(4);
+                }
+                Some(Indirection::Near64) => {
+                    return Ok(8);
+                }
+                None => {}
+                _ => {
+                    return Err(anyhow::anyhow!(format!(
+                        "Unsupported pointer kind {:?} for index #{}",
+                        data.indirection, index.0
+                    )));
+                }
+            }
+            match data.kind {
+                PrimitiveKind::Char
+                | PrimitiveKind::RChar
+                | PrimitiveKind::UChar
+                | PrimitiveKind::I8
+                | PrimitiveKind::U8
+                | PrimitiveKind::Bool8 => Ok(1),
+                PrimitiveKind::WChar
+                | PrimitiveKind::RChar16
+                | PrimitiveKind::Short
+                | PrimitiveKind::UShort
+                | PrimitiveKind::I16
+                | PrimitiveKind::U16
+                | PrimitiveKind::F16
+                | PrimitiveKind::Bool16 => Ok(2),
+                PrimitiveKind::RChar32
+                | PrimitiveKind::Long
+                | PrimitiveKind::ULong
+                | PrimitiveKind::I32
+                | PrimitiveKind::U32
+                | PrimitiveKind::F32
+                | PrimitiveKind::Complex32
+                | PrimitiveKind::Bool32 => Ok(4),
+                PrimitiveKind::Quad
+                | PrimitiveKind::UQuad
+                | PrimitiveKind::I64
+                | PrimitiveKind::U64
+                | PrimitiveKind::F64
+                | PrimitiveKind::Complex64
+                | PrimitiveKind::Bool64 => Ok(8),
+                PrimitiveKind::Octa
+                | PrimitiveKind::UOcta
+                | PrimitiveKind::I128
+                | PrimitiveKind::U128
+                | PrimitiveKind::F128
+                | PrimitiveKind::Complex128 => Ok(16),
+                _ => Err(anyhow::anyhow!(format!(
+                    "Unsupported PrimitiveKind {:?} for index #{}",
+                    data, index.0
+                ))),
+            }
+        }
+        _ => Err(anyhow::anyhow!(format!("Unrecognized type record for index 0x{:X}", index.0))),
+    }
+}
+
+/// Try to set the size of the object symbol according to its type
+fn set_obj_size_by_type(obj_sym: &mut ObjSymbol, ty_finder: &TypeFinder, index: TypeIndex) {
+    match lookup_type_size(ty_finder, index) {
+        Ok(ty_size) => {
+            obj_sym.size = ty_size;
+            obj_sym.size_known = true;
+        }
+        Err(err) => {
+            log::warn!("Object size lookup failed for {}: {:?}", obj_sym.name, err);
+        }
+    }
+}
+
+/// Try to set the size of the object symbol according to its name
+fn set_obj_size_by_name(obj_sym: &mut ObjSymbol, name: &str) {
+    let is_string = name.starts_with("??_C@_0");
+    let is_wstring = name.starts_with("??_C@_1");
+    if is_string || is_wstring {
+        // In either case, the size is encoded into the symbol name itself
+        obj_sym.data_kind = if is_string { ObjDataKind::String } else { ObjDataKind::String16 };
+        let ptr = &mut name["??_C@_0".len()..].chars();
+        let mut str_size = 0;
+        for ch in ptr.by_ref() {
+            if ch.is_ascii_digit() {
+                str_size = ch.to_digit(10).unwrap() as u64 + 1;
+                break;
+            } else if ('A'..='P').contains(&ch) {
+                str_size = str_size * 16 + (ch as u8 - b'A') as u64;
+            } else {
+                assert!(
+                    ch == '@',
+                    "Expected '@'-terminator while parsing length of string constant"
+                );
+                break;
+            }
+        }
+        obj_sym.size = str_size;
+        obj_sym.size_known = true;
+    } else if name.starts_with("__real@") {
+        if name.len() == "__real@00000000".len() {
+            obj_sym.data_kind = ObjDataKind::Float;
+            obj_sym.size = 4;
+        } else if name.len() == "__real@0000000000000000".len() {
+            obj_sym.data_kind = ObjDataKind::Double;
+            obj_sym.size = 8;
+        }
+        obj_sym.size_known = true;
+    }
+}
+
 #[derive(Debug, PartialEq, PartialOrd, Eq, Ord)]
 struct CoffGroup {
     /// Starting address of the group
@@ -77,10 +204,14 @@ pub struct PdbAnalyzeResult {
     pub labels: Vec<SectionAddress>,
 }
 
-/// Extract translation units, splits, and symbols from a PDB
+/// Extract translation units, splits, and symbols from a PDB. The use_types
+/// flag enables the parsing of the type information stream to deduce object
+/// sizes. This is optional, since some PDBs are known to have corrupt data
+/// in this stream.
 pub fn try_parse_pdb(
     path: &Utf8NativePathBuf,
     section_addrs: &ObjSections,
+    use_types: bool,
 ) -> Result<PdbAnalyzeResult> {
     let mut dbfile = pdb2::PDB::open(File::open(path)?)?;
 
@@ -113,6 +244,18 @@ pub fn try_parse_pdb(
                 pdb_hdr_names[i],
                 section_addrs[i as u32].name
             );
+        }
+    }
+
+    // Index all of the type records from the TPI; type data will be parsed
+    // as needed to deduce the sizes of object symbols
+    let tpi = dbfile.type_information()?;
+    let mut ty_finder = tpi.finder();
+    let mut ty_iter = tpi.iter();
+
+    if use_types {
+        while (ty_iter.next()?).is_some() {
+            ty_finder.update(&ty_iter);
         }
     }
 
@@ -165,15 +308,16 @@ pub fn try_parse_pdb(
                 // TODO: handle code/data merging properly, instead of
                 // overwriting the name
 
-                // TODO: Not all S_PUB32 records represent functions or objects;
-                // Some may just be labels, which can be skipped
-                obj_sym.name = data.name.to_string().into();
                 obj_sym.address = symaddr.address.into();
                 obj_sym.section = Some(symaddr.section);
                 obj_sym.flags = ObjSymbolFlagSet(ObjSymbolFlags::Global.into());
                 obj_sym.kind =
                     if data.function { ObjSymbolKind::Function } else { ObjSymbolKind::Object };
                 obj_sym.data_kind = ObjDataKind::Unknown;
+
+                let name: String = data.name.to_string().into();
+                set_obj_size_by_name(obj_sym, &name);
+                obj_sym.name = name;
             }
             Ok(pdb2::SymbolData::Data(data)) => {
                 if data.offset.section == 0 {
@@ -192,11 +336,9 @@ pub fn try_parse_pdb(
                     obj_sym.address = symaddr.address.into();
                     obj_sym.section = Some(symaddr.section);
                 }
-                // TODO: We can also deduce the size by using the type
-                // field to index into the TPI.
-                // Build a TypeFinder, then use it to compute object sizes
-                // while iterating through the data symbols.
-                // See https://docs.rs/pdb2/latest/pdb2/struct.ItemInformation.html
+                if use_types {
+                    set_obj_size_by_type(obj_sym, &ty_finder, data.type_index);
+                }
             }
             Ok(pdb2::SymbolData::ThreadStorage(data)) => {
                 if data.offset.section == 0 {
@@ -215,8 +357,9 @@ pub fn try_parse_pdb(
                     obj_sym.address = symaddr.address.into();
                     obj_sym.section = Some(symaddr.section);
                 }
-
-                // TODO: Above note for DATA records also applies here
+                if use_types {
+                    set_obj_size_by_type(obj_sym, &ty_finder, data.type_index);
+                }
             }
             Ok(pdb2::SymbolData::Procedure(data)) => {
                 if data.offset.section == 0 {
@@ -249,7 +392,7 @@ pub fn try_parse_pdb(
                 // This is an S_THUNK32 record
                 obj_sym.size = data.len as u64;
                 obj_sym.size_known = true;
-                obj_sym.align = Some(4);
+                obj_sym.align = Some(8);
             }
             Ok(pdb2::SymbolData::Label(data)) => {
                 if data.offset.section == 0 {
@@ -372,9 +515,6 @@ pub fn try_parse_pdb(
 
     let mut contribs = dbi.section_contributions()?;
     while let Some(contrib) = contribs.next()? {
-        // TODO: Extract file names from the Sources substream to replace the
-        // auto-generated names. Take only the base name, fix the extension,
-        // and disambiguate identical names with a prefix
         let s_addr = to_section_addr(&pdbmap, section_addrs, &contrib.offset);
         let sec_idx = s_addr.section as usize;
         let start: u64 = s_addr.address.into();
@@ -415,8 +555,6 @@ pub fn try_parse_pdb(
                 rename: rename.clone(),
             });
         }
-        // FIXME: This currently requires detect_objects=false to work.
-        // Deducing exact object sizes from the PDB should fix this
         curr_split.end = end as u32;
     }
 
